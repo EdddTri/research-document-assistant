@@ -1,0 +1,118 @@
+name: research-assistant
+
+x-backend-environment: &backend-environment
+  DATABASE_URL: postgresql+psycopg://research_backend:${BACKEND_DB_PASSWORD:?Set BACKEND_DB_PASSWORD}@postgres/${DB_NAME:-research}
+  BROKER_URL: redis://redis:6379/0
+  STORAGE_ROOT: /data
+  JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+  INTERNAL_SECRET: ${INTERNAL_SECRET:?Set INTERNAL_SECRET}
+  COOKIE_SECURE: ${COOKIE_SECURE:-true}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+  AGENT_URL: http://agent:8001
+
+x-agent-environment: &agent-environment
+  DATABASE_URL: postgresql+psycopg://research_agent:${AGENT_DB_PASSWORD:?Set AGENT_DB_PASSWORD}@postgres/${DB_NAME:-research}
+  BROKER_URL: redis://redis:6379/0
+  STORAGE_ROOT: /data
+  JWT_SECRET: unused-private-service-does-not-sign-user-tokens
+  INTERNAL_SECRET: ${INTERNAL_SECRET:?Set INTERNAL_SECRET}
+  OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+  EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+  EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-4}
+  ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5.4-mini}
+  VISION_MODEL: ${VISION_MODEL:-gpt-5.4-mini}
+  ANSWER_REASONING_EFFORT: ${ANSWER_REASONING_EFFORT-low}
+  VISION_REASONING_EFFORT: ${VISION_REASONING_EFFORT-none}
+  VISION_TIMEOUT_SECONDS: ${VISION_TIMEOUT_SECONDS:-120}
+  VISION_MAX_TOKENS: ${VISION_MAX_TOKENS:-4096}
+  VISION_SPLIT_MAX_DEPTH: ${VISION_SPLIT_MAX_DEPTH:-3}
+  VISION_SPLIT_MIN_SIDE: ${VISION_SPLIT_MIN_SIDE:-192}
+  VISION_SPLIT_OVERLAP: ${VISION_SPLIT_OVERLAP:-0.08}
+  VISION_MIN_INTERVAL_SECONDS: ${VISION_MIN_INTERVAL_SECONDS:-0}
+  JUDGE_MODEL: ${JUDGE_MODEL:-}
+  RETRIEVAL_MODE: ${RETRIEVAL_MODE:-hybrid}
+  TRACE_DOCUMENT_CONTENT: ${TRACE_DOCUMENT_CONTENT:-false}
+  LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+  LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+  LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-research-assistant}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: ${DB_NAME:-research}
+      POSTGRES_USER: research_migration
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      BACKEND_DB_PASSWORD: ${BACKEND_DB_PASSWORD}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/init-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research_migration -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  migrate:
+    build: { context: .., dockerfile: research-backend/Dockerfile }
+    environment:
+      <<: *backend-environment
+      DATABASE_URL: postgresql+psycopg://research_migration:${POSTGRES_PASSWORD}@postgres/${DB_NAME:-research}
+    depends_on:
+      postgres: { condition: service_healthy }
+    command: ["sh", "-c", "alembic upgrade head && python -m research_backend.provision_roles"]
+  backend:
+    build: { context: .., dockerfile: research-backend/Dockerfile }
+    environment: *backend-environment
+    volumes: [private_storage:/data]
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+  agent:
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    build: { context: .., dockerfile: research-agent/Dockerfile }
+    environment: *agent-environment
+    volumes: [private_storage:/data:ro]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+  worker:
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    build: { context: .., dockerfile: research-agent/Dockerfile }
+    environment:
+      <<: *agent-environment
+      DATABASE_URL: postgresql+psycopg://research_worker:${WORKER_DB_PASSWORD}@postgres/${DB_NAME:-research}
+    volumes: [private_storage:/data]
+    command: ["celery", "-A", "research_agent.worker:app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+  frontend:
+    build: { context: .., dockerfile: research-frontend/Dockerfile }
+    ports: ["127.0.0.1:5173:80"]
+    depends_on: [backend, agent]
+  pgadmin:
+    image: dpage/pgadmin4:9
+    profiles: ["admin"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-}
+    ports: ["127.0.0.1:5050:80"]
+    depends_on: [postgres]
+
+volumes:
+  postgres_data:
+  redis_data:
+  private_storage:

@@ -1,0 +1,34 @@
+# Infrastructure only for terminal development. Uses separate data from packaged Compose.
+name: research-assistant-dev
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: ${DB_NAME:-research}
+      POSTGRES_USER: research_migration
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      BACKEND_DB_PASSWORD: ${BACKEND_DB_PASSWORD:?Set BACKEND_DB_PASSWORD}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?Set WORKER_DB_PASSWORD}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?Set AGENT_DB_PASSWORD}
+    ports: ["127.0.0.1:${DB_PORT:-5432}:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/init-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research_migration -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  postgres_data:
+  redis_data:
